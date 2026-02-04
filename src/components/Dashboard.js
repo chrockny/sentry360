@@ -4,25 +4,22 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import StatusBadge from "./StatusBadge";
 import SensorCard from "./SensorCard";
 import { SENSOR_RANGES } from "../lib/ranges";
-import { clamp, fmt, fmtSecondsToClock, fmtMsToClock } from "../lib/format";
+import { clamp } from "../lib/format";
 
 const DEFAULT_POLL = 1200;
-const HISTORY_LEN = 60; // puntos por sensor (ajústalo)
+const HISTORY_LEN = 60;
+const OFFLINE_TIMEOUT_MS = 5000; // si seq no cambia por este tiempo => OFFLINE
 
 function buildUrl() {
-
-
-  const url = `https://sentry-360-default-rtdb.firebaseio.com/live.json`;
-
-  return url;
+  // Hardcode (como lo tienes). Recomendado: pasar a env en Vercel.
+  return "https://sentry-360-default-rtdb.firebaseio.com/live.json";
 }
 
 function normalizeTelemetry(raw) {
   const t = raw && typeof raw === "object" ? raw : {};
 
   const tsMs =
-    Number.isFinite(+t.ts_ms) ? +t.ts_ms :
-    (Number.isFinite(+t.ts) ? +t.ts : null);
+    Number.isFinite(+t.ts_ms) ? +t.ts_ms : Number.isFinite(+t.ts) ? +t.ts : null;
 
   return {
     device: String(t.device ?? "SENTRY-360"),
@@ -38,7 +35,7 @@ function normalizeTelemetry(raw) {
     gas: Number.isFinite(+t.gas) ? +t.gas : null,
     base: Number.isFinite(+t.base) ? +t.base : null,
 
-    luz: Number.isFinite(+t.luz) ? +t.luz : null,   // <- NUEVO
+    luz: Number.isFinite(+t.luz) ? +t.luz : null,
 
     rain: Boolean(t.rain ?? false),
     flame: Boolean(t.flame ?? false),
@@ -49,13 +46,18 @@ function normalizeTelemetry(raw) {
   };
 }
 
-
-
 function pushHistory(history, key, point) {
   const prev = history[key] || [];
   const next = prev.concat(point);
   if (next.length > HISTORY_LEN) return next.slice(next.length - HISTORY_LEN);
   return next;
+}
+
+function luzNivel(v) {
+  if (!Number.isFinite(v)) return "-";
+  if (v > 700) return "ALTA";
+  if (v > 300) return "NORMAL";
+  return "OSCURO";
 }
 
 export default function Dashboard() {
@@ -65,39 +67,43 @@ export default function Dashboard() {
     return Number.isFinite(v) ? clamp(v, 300, 10000) : DEFAULT_POLL;
   }, []);
 
+  // Anti-hydration (solo para campos que cambian “con el tiempo” en el primer render)
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
   const [telemetry, setTelemetry] = useState(() =>
     normalizeTelemetry({
-
       device: "SENTRY-360",
       online: false,
       estado: "OFFLINE",
       motivo: "-",
-      ts_ms: Date.now(),
+      ts_ms: null,
     })
   );
-const [mounted, setMounted] = useState(false);
 
-useEffect(() => {
-  setMounted(true);
-}, []);
-
-const [history, setHistory] = useState(() => ({
-  T: [],
-  H: [],
-  HI: [],
-  gas: [],
-  base: [],
-  luz: [], // <- NUEVO
-}));
-
+  const [history, setHistory] = useState(() => ({
+    T: [],
+    H: [],
+    HI: [],
+    gas: [],
+    base: [],
+    luz: [],
+  }));
 
   const [net, setNet] = useState({ ok: true, lastErr: null, lastFetchMs: null });
 
+  // Offline detector por “freeze de datos”
   const lastSeqRef = useRef(null);
+  const lastChangeMsRef = useRef(Date.now());
+  const [offlineByStale, setOfflineByStale] = useState(false);
 
   useEffect(() => {
     if (!url) {
-      setNet({ ok: false, lastErr: "Falta NEXT_PUBLIC_FIREBASE_DB_URL o NEXT_PUBLIC_FIREBASE_PATH", lastFetchMs: null });
+      setNet({
+        ok: false,
+        lastErr: "URL Firebase no configurada",
+        lastFetchMs: null,
+      });
       return;
     }
 
@@ -108,37 +114,70 @@ const [history, setHistory] = useState(() => ({
         const res = await fetch(url, { cache: "no-store" });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-
         if (!alive) return;
 
         const norm = normalizeTelemetry(data);
+        const now = Date.now();
 
-        // Evita “repetir” el mismo frame si el seq no cambia (si tu nodo se actualiza por seq)
+        // 1) Detecta si el payload “cambió” usando seq
         const seq = norm.seq;
-        const seqUnchanged = seq != null && lastSeqRef.current === seq;
+        const seqChanged = seq != null && seq !== lastSeqRef.current;
 
-        setTelemetry(norm);
-        setNet({ ok: true, lastErr: null, lastFetchMs: Date.now() });
-
-        if (!seqUnchanged) {
+        if (seqChanged) {
           lastSeqRef.current = seq;
+          lastChangeMsRef.current = now;
+          if (offlineByStale) setOfflineByStale(false);
+        } else {
+          // Si seq no cambia, puede estar congelado
+          if (now - lastChangeMsRef.current > OFFLINE_TIMEOUT_MS) {
+            if (!offlineByStale) setOfflineByStale(true);
+          }
+        }
 
-          const ts = norm.ts_ms || Date.now();
+        // 2) Aplica estado final (la consola manda)
+        const finalTelemetry = {
+          ...norm,
+          online: offlineByStale ? false : norm.online,
+          estado: offlineByStale ? "OFFLINE" : norm.estado,
+          motivo: offlineByStale ? "STALE DATA" : norm.motivo,
+        };
+
+        setTelemetry(finalTelemetry);
+        setNet({ ok: true, lastErr: null, lastFetchMs: now });
+
+        // 3) Historial: solo agrega punto cuando cambió seq
+        if (seqChanged) {
+          const ts = Number.isFinite(finalTelemetry.ts_ms)
+            ? finalTelemetry.ts_ms
+            : now;
+
           setHistory((h) => {
             const nh = { ...h };
-            if (norm.T != null) nh.T = pushHistory(h, "T", { t: ts, v: norm.T });
-            if (norm.H != null) nh.H = pushHistory(h, "H", { t: ts, v: norm.H });
-            if (norm.HI != null) nh.HI = pushHistory(h, "HI", { t: ts, v: norm.HI });
-            if (norm.gas != null) nh.gas = pushHistory(h, "gas", { t: ts, v: norm.gas });
-            if (norm.base != null) nh.base = pushHistory(h, "base", { t: ts, v: norm.base });
-            if (norm.luz != null) nh.luz = pushHistory(h, "luz", { t: ts, v: norm.luz });
-
+            if (finalTelemetry.T != null) nh.T = pushHistory(h, "T", { t: ts, v: finalTelemetry.T });
+            if (finalTelemetry.H != null) nh.H = pushHistory(h, "H", { t: ts, v: finalTelemetry.H });
+            if (finalTelemetry.HI != null) nh.HI = pushHistory(h, "HI", { t: ts, v: finalTelemetry.HI });
+            if (finalTelemetry.gas != null) nh.gas = pushHistory(h, "gas", { t: ts, v: finalTelemetry.gas });
+            if (finalTelemetry.base != null) nh.base = pushHistory(h, "base", { t: ts, v: finalTelemetry.base });
+            if (finalTelemetry.luz != null) nh.luz = pushHistory(h, "luz", { t: ts, v: finalTelemetry.luz });
             return nh;
           });
         }
       } catch (e) {
         if (!alive) return;
-        setNet({ ok: false, lastErr: String(e?.message || e), lastFetchMs: Date.now() });
+
+        const now = Date.now();
+        setNet({ ok: false, lastErr: String(e?.message || e), lastFetchMs: now });
+
+        // Si no hay cambios por mucho tiempo, marca offline
+        if (now - lastChangeMsRef.current > OFFLINE_TIMEOUT_MS) {
+          setOfflineByStale(true);
+          setTelemetry((prev) => ({
+            ...prev,
+            online: false,
+            estado: "OFFLINE",
+            motivo: "LINK LOST",
+          }));
+        }
       }
     }
 
@@ -149,9 +188,7 @@ const [history, setHistory] = useState(() => ({
       alive = false;
       clearInterval(id);
     };
-  }, [url, pollMs]);
-
-  const isOnline = telemetry.online && telemetry.estado !== "OFFLINE";
+  }, [url, pollMs, offlineByStale]);
 
   return (
     <div className="dash">
@@ -171,27 +208,25 @@ const [history, setHistory] = useState(() => ({
             <div className="statusKey">Motivo</div>
             <div className="statusVal">{telemetry.motivo}</div>
           </div>
-<div className="statusRow">
-  <div className="statusKey">LUZ</div>
-  <div className="statusVal mono">{telemetry.luz ?? "-"} (
-{telemetry.luz > 700 ? "ALTA" : telemetry.luz > 300 ? "NORMAL" : "OSCURO"}
 
-  )</div>
-</div>
+          <div className="statusRow">
+            <div className="statusKey">LUZ</div>
+            <div className="statusVal mono">
+              {telemetry.luz ?? "-"}{" "}
+              <span className="muted">({luzNivel(telemetry.luz)})</span>
+            </div>
+          </div>
 
           <div className="statusRow">
             <div className="statusKey">SEQ</div>
             <div className="statusVal mono">{telemetry.seq ?? "-"}</div>
           </div>
 
-
-         <div className="statusRow">
-  <div className="statusKey">TS</div>
-  <div className="statusVal mono">
-    {mounted ? String(telemetry.ts_ms ?? "-") : "-"}
-  </div>
-
-
+          <div className="statusRow">
+            <div className="statusKey">TS_MS</div>
+            <div className="statusVal mono">
+              {mounted ? String(telemetry.ts_ms ?? "-") : "-"}
+            </div>
           </div>
 
           <div className="statusRow">
@@ -202,13 +237,12 @@ const [history, setHistory] = useState(() => ({
             </div>
           </div>
 
-         <div className="flags">
-  <div className={"flag " + (telemetry.rain ? "on" : "")}>RAIN</div>
-  <div className={"flag " + (telemetry.flame ? "on" : "")}>FLAME</div>
-  <div className={"flag " + (telemetry.soloPeligro ? "on" : "")}>SOLO-PELIGRO</div>
-  <div className={"flag " + (telemetry.online ? "on" : "")}>ONLINE</div>
-</div>
-
+          <div className="flags">
+            <div className={"flag " + (telemetry.rain ? "on" : "")}>RAIN</div>
+            <div className={"flag " + (telemetry.flame ? "on" : "")}>FLAME</div>
+            <div className={"flag " + (telemetry.soloPeligro ? "on" : "")}>SOLO-PELIGRO</div>
+            <div className={"flag " + (telemetry.online ? "on" : "")}>ONLINE</div>
+          </div>
         </div>
 
         <div className="noteBlock">
@@ -217,9 +251,18 @@ const [history, setHistory] = useState(() => ({
             Arduino UNO (sensores) → ESP32 (gateway UART con ACK/CRC/SEQ) → Firebase RTDB → Consola Web.
           </div>
 
-          <div className="noteTitle" style={{ marginTop: 14 }}>REGLAS VISUALES</div>
+          <div className="noteTitle" style={{ marginTop: 14 }}>
+            REGLAS VISUALES
+          </div>
           <div className="noteText">
             NORMAL / ALERTA / PELIGRO se renderiza como señal de misión: glow, bordes, ruido ligero y rejilla.
+          </div>
+
+          <div className="noteTitle" style={{ marginTop: 14 }}>
+            OFFLINE RULE
+          </div>
+          <div className="noteText">
+            Si el <span className="mono">seq</span> no cambia por {OFFLINE_TIMEOUT_MS}ms → OFFLINE.
           </div>
         </div>
       </div>
@@ -266,26 +309,19 @@ const [history, setHistory] = useState(() => ({
           range={SENSOR_RANGES.base}
         />
         <SensorCard
-  label="Luz (LDR)"
-  unit="adc"
-  value={telemetry.luz}
-  estado={telemetry.estado}
-  series={history.luz}
-  range={SENSOR_RANGES.luz}
-/>
-
+          label="Luz (LDR)"
+          unit="adc"
+          value={telemetry.luz}
+          estado={telemetry.estado}
+          series={history.luz}
+          range={SENSOR_RANGES.luz}
+        />
       </div>
 
       <div className="hintRow">
-        <div className="hintPill mono">
-          POLL {pollMs}ms
-        </div>
-        <div className="hintPill mono">
-          URL {url ? "OK" : "MISSING"}
-        </div>
-        <div className="hintPill mono">
-          HIST {HISTORY_LEN} pts
-        </div>
+        <div className="hintPill mono">POLL {pollMs}ms</div>
+        <div className="hintPill mono">URL {url ? "OK" : "MISSING"}</div>
+        <div className="hintPill mono">HIST {HISTORY_LEN} pts</div>
       </div>
     </div>
   );
