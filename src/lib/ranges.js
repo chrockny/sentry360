@@ -5,5 +5,5 @@ export const SENSOR_RANGES = {
   gas: { min: 0,   max: 100 },
   base:{ min: 0,   max: 100 },
 
-  luz: { min: 0,   max: 4095 }, // <- NUEVO (típico ADC ESP32)
+  luz: { min: 0,   max: 1000 }, // <- NUEVO (típico ADC ESP32)
 };

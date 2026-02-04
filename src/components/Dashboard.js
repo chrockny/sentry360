@@ -183,10 +183,6 @@ const [history, setHistory] = useState(() => ({
             <div className="statusKey">SEQ</div>
             <div className="statusVal mono">{telemetry.seq ?? "-"}</div>
           </div>
-<div className="statusRow">
-  <div className="statusKey">LUZ</div>
-  <div className="statusVal mono">{telemetry.luz}</div>
-</div>
 
 
          <div className="statusRow">
