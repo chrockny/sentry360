@@ -11,7 +11,7 @@ import { getDatabase, ref, onValue, off, update } from "firebase/database";
 import { getAnalytics } from "firebase/analytics";
 
 const HISTORY_LEN = 60;
-const OFFLINE_TIMEOUT_MS = 2000;
+const OFFLINE_TIMEOUT_MS = 4000;
 const STALE_CHECK_MS = 200;
 
 // Firebase config (embebido)
@@ -28,6 +28,9 @@ const firebaseConfig = {
 
 function normalizeTelemetry(raw) {
   const t = raw && typeof raw === "object" ? raw : {};
+
+  const tsServer =
+    Number.isFinite(+t.ts_server) ? +t.ts_server : null;
 
   const tsMs =
     Number.isFinite(+t.ts_ms) ? +t.ts_ms : Number.isFinite(+t.ts) ? +t.ts : null;
@@ -52,13 +55,14 @@ function normalizeTelemetry(raw) {
     soloPeligro: Boolean(t.soloPeligro ?? false),
 
     seq: Number.isFinite(+t.seq) ? +t.seq : null,
-    ts_ms: tsMs,
 
-    // ESTADOS CONFIRMADOS POR ESP32 (los vamos a publicar desde el ESP32)
+    // ambos timestamps
+    ts_server: tsServer, // epoch ms (correcto para stale)
+    ts_ms: tsMs,         // millis() del ESP32 (solo informativo)
+
     lightOn: Boolean(t.lightOn ?? false),
     fanOn: Boolean(t.fanOn ?? false),
 
-    // opcional: si quieres ver errores de control desde ESP32
     lastCtrlErr: String(t.lastCtrlErr ?? ""),
   };
 }
@@ -118,7 +122,7 @@ export default function Dashboard() {
   const [net, setNet] = useState({ ok: true, lastErr: null, lastMs: null });
 
   // CONTROL: lo que pide la web (desde /ctrl)
-  const [ctrl, setCtrl] = useState({ light: false, fan: false, ts_ms: null });
+const [ctrl, setCtrl] = useState({ luzMode: "OFF", fanMode: "OFF", ts_ms: null });
   const [ctrlNet, setCtrlNet] = useState({ ok: true, lastErr: null });
 
   // Offline detector por “freeze de datos”
@@ -135,11 +139,11 @@ export default function Dashboard() {
       (snap) => {
         if (!alive) return;
         const v = snap.val() || {};
-        setCtrl({
-          light: Boolean(v.light ?? false),
-          fan: Boolean(v.fan ?? false),
-          ts_ms: Number.isFinite(+v.ts_ms) ? +v.ts_ms : null,
-        });
+       setCtrl({
+  luzMode: String(v.luzMode ?? "OFF").toUpperCase(),
+  fanMode: String(v.fanMode ?? "OFF").toUpperCase(),
+  ts_ms: Number.isFinite(+v.ts_ms) ? +v.ts_ms : null,
+});
         setCtrlNet({ ok: true, lastErr: null });
       },
       (err) => {
@@ -162,7 +166,7 @@ export default function Dashboard() {
   // Enviar comandos a /ctrl (la web manda; ESP32 ejecuta)
   async function setLight(next) {
     try {
-      await update(ctrlRef, { light: !!next, ts_ms: Date.now() });
+await update(ctrlRef, { luzMode: next ? "ON" : "OFF", ts_ms: Date.now() });
     } catch (e) {
       console.error(e);
     }
@@ -170,7 +174,7 @@ export default function Dashboard() {
 
   async function setFan(next) {
     try {
-      await update(ctrlRef, { fan: !!next, ts_ms: Date.now() });
+await update(ctrlRef, { fanMode: next ? "ON" : "OFF", ts_ms: Date.now() });
     } catch (e) {
       console.error(e);
     }
@@ -188,16 +192,19 @@ export default function Dashboard() {
         const data = snap.val();
         const norm = normalizeTelemetry(data);
         const now = Date.now();
+       const tsServer = norm.ts_server;
+const seq = norm.seq;
 
-        const seq = norm.seq;
-        const seqChanged = seq != null && seq !== lastSeqRef.current;
+// usamos ts_server si existe; si no, fallback a seq
+const marker = tsServer != null ? tsServer : seq;
+const markerChanged =
+  marker != null && marker !== lastSeqRef.current;
 
-        if (seqChanged) {
-          lastSeqRef.current = seq;
-          lastChangeMsRef.current = now;
-          offlineRef.current = false;
-        }
-
+if (markerChanged) {
+  lastSeqRef.current = marker;
+  lastChangeMsRef.current = now;
+  offlineRef.current = false;
+}
         const finalTelemetry = {
           ...norm,
           online: offlineRef.current ? false : norm.online,
@@ -208,7 +215,7 @@ export default function Dashboard() {
         setTelemetry(finalTelemetry);
         setNet({ ok: true, lastErr: null, lastMs: now });
 
-        if (seqChanged) {
+        if (markerChanged) {
           const ts = Number.isFinite(finalTelemetry.ts_ms)
             ? finalTelemetry.ts_ms
             : now;
@@ -238,19 +245,29 @@ export default function Dashboard() {
       }
     );
 
-    const staleId = setInterval(() => {
-      const now = Date.now();
-      if (now - lastChangeMsRef.current > OFFLINE_TIMEOUT_MS) {
-        offlineRef.current = true;
-        setTelemetry((prev) => ({
-          ...prev,
-          online: false,
-          estado: "OFFLINE",
-          motivo: "STALE DATA",
-        }));
-      }
-    }, STALE_CHECK_MS);
+const staleId = setInterval(() => {
+  const now = Date.now();
 
+  setTelemetry((prev) => {
+    const tsServer = Number.isFinite(+prev.ts_server) ? +prev.ts_server : null;
+
+    // si tenemos ts_server, usamos eso (regla correcta)
+    const isStale = tsServer != null
+      ? (now - tsServer) > OFFLINE_TIMEOUT_MS
+      : (now - lastChangeMsRef.current) > OFFLINE_TIMEOUT_MS;
+
+    offlineRef.current = isStale;
+
+    if (!isStale) return prev;
+
+    return {
+      ...prev,
+      online: false,
+      estado: "OFFLINE",
+      motivo: "STALE DATA",
+    };
+  });
+}, STALE_CHECK_MS);
     return () => {
       alive = false;
       clearInterval(staleId);
@@ -301,6 +318,12 @@ export default function Dashboard() {
               {mounted ? String(telemetry.ts_ms ?? "-") : "-"}
             </div>
           </div>
+          <div className="statusRow">
+  <div className="statusKey">TS_SERVER</div>
+  <div className="statusVal mono">
+    {mounted ? String(telemetry.ts_server ?? "-") : "-"}
+  </div>
+</div>
 
           <div className="statusRow">
             <div className="statusKey">Consola</div>
@@ -347,7 +370,7 @@ export default function Dashboard() {
               <div className="controlLeft">
                 <div className="controlLabel">LUCES</div>
                 <div className="controlState mono">
-                  CMD: {ctrl.light ? "ON" : "OFF"} · ESP32:{" "}
+                  CMD: {ctrl.luzMode}  {}
                   <span className={telemetry.lightOn ? "ok" : "muted"}>
                     {telemetry.lightOn ? "ON" : "OFF"}
                   </span>
@@ -356,14 +379,14 @@ export default function Dashboard() {
 
               <div className="controlBtns">
                 <button
-                  className={"btnCtl " + (ctrl.light ? "on" : "")}
+className={"btnCtl " + (ctrl.luzMode === "ON" ? "on" : "")}
                   onClick={() => setLight(true)}
                   disabled={!mounted}
                 >
                   PRENDER
                 </button>
                 <button
-                  className={"btnCtl " + (!ctrl.light ? "on" : "")}
+className={"btnCtl " + (ctrl.luzMode === "OFF" ? "on" : "")}
                   onClick={() => setLight(false)}
                   disabled={!mounted}
                 >
@@ -376,7 +399,7 @@ export default function Dashboard() {
               <div className="controlLeft">
                 <div className="controlLabel">VENTILADOR</div>
                 <div className="controlState mono">
-                  CMD: {ctrl.fan ? "ON" : "OFF"} · ESP32:{" "}
+                  CMD: {ctrl.fanMode} {}
                   <span className={telemetry.fanOn ? "ok" : "muted"}>
                     {telemetry.fanOn ? "ON" : "OFF"}
                   </span>
@@ -385,15 +408,14 @@ export default function Dashboard() {
 
               <div className="controlBtns">
                 <button
-                  className={"btnCtl " + (ctrl.fan ? "on" : "")}
-                  onClick={() => setFan(true)}
+className={"btnCtl " + (ctrl.fanMode === "ON" ? "on" : "")}
+              onClick={() => setFan(true)}
                   disabled={!mounted}
                 >
                   PRENDER
                 </button>
                 <button
-                  className={"btnCtl " + (!ctrl.fan ? "on" : "")}
-                  onClick={() => setFan(false)}
+className={"btnCtl " + (ctrl.fanMode === "OFF" ? "on" : "")}                      onClick={() => setFan(false)}
                   disabled={!mounted}
                 >
                   APAGAR
