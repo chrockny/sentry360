@@ -4,16 +4,27 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import StatusBadge from "./StatusBadge";
 import SensorCard from "./SensorCard";
 import { SENSOR_RANGES } from "../lib/ranges";
-import { clamp } from "../lib/format";
 
-const DEFAULT_POLL = 1200;
+// Firebase (Realtime Database)
+import { initializeApp, getApps } from "firebase/app";
+import { getDatabase, ref, onValue, off, update } from "firebase/database";
+import { getAnalytics } from "firebase/analytics";
+
 const HISTORY_LEN = 60;
-const OFFLINE_TIMEOUT_MS = 5000; // si seq no cambia por este tiempo => OFFLINE
+const OFFLINE_TIMEOUT_MS = 2000;
+const STALE_CHECK_MS = 200;
 
-function buildUrl() {
-  // Hardcode (como lo tienes). Recomendado: pasar a env en Vercel.
-  return "https://sentry-360-default-rtdb.firebaseio.com/live.json";
-}
+// Firebase config (embebido)
+const firebaseConfig = {
+  apiKey: "AIzaSyCmlA0RWbwWvGrc0VjvnGSOyax91_0Uo7s",
+  authDomain: "sentry-360.firebaseapp.com",
+  databaseURL: "https://sentry-360-default-rtdb.firebaseio.com",
+  projectId: "sentry-360",
+  storageBucket: "sentry-360.firebasestorage.app",
+  messagingSenderId: "718662351345",
+  appId: "1:718662351345:web:d80cbb3cae870cf720ac50",
+  measurementId: "G-RVP0K69VHM",
+};
 
 function normalizeTelemetry(raw) {
   const t = raw && typeof raw === "object" ? raw : {};
@@ -34,7 +45,6 @@ function normalizeTelemetry(raw) {
 
     gas: Number.isFinite(+t.gas) ? +t.gas : null,
     base: Number.isFinite(+t.base) ? +t.base : null,
-
     luz: Number.isFinite(+t.luz) ? +t.luz : null,
 
     rain: Boolean(t.rain ?? false),
@@ -43,6 +53,13 @@ function normalizeTelemetry(raw) {
 
     seq: Number.isFinite(+t.seq) ? +t.seq : null,
     ts_ms: tsMs,
+
+    // ESTADOS CONFIRMADOS POR ESP32 (los vamos a publicar desde el ESP32)
+    lightOn: Boolean(t.lightOn ?? false),
+    fanOn: Boolean(t.fanOn ?? false),
+
+    // opcional: si quieres ver errores de control desde ESP32
+    lastCtrlErr: String(t.lastCtrlErr ?? ""),
   };
 }
 
@@ -60,14 +77,20 @@ function luzNivel(v) {
   return "OSCURO";
 }
 
-export default function Dashboard() {
-  const url = useMemo(buildUrl, []);
-  const pollMs = useMemo(() => {
-    const v = Number(process.env.NEXT_PUBLIC_POLL_MS);
-    return Number.isFinite(v) ? clamp(v, 300, 10000) : DEFAULT_POLL;
-  }, []);
+function initFirebaseOnce() {
+  const app = getApps().length ? getApps()[0] : initializeApp(firebaseConfig);
+  try {
+    getAnalytics(app);
+  } catch {}
+  const db = getDatabase(app);
+  return { app, db };
+}
 
-  // Anti-hydration (solo para campos que cambian “con el tiempo” en el primer render)
+export default function Dashboard() {
+  const { db } = useMemo(() => initFirebaseOnce(), []);
+  const liveRef = useMemo(() => ref(db, "live"), [db]);
+  const ctrlRef = useMemo(() => ref(db, "ctrl"), [db]);
+
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
 
@@ -78,6 +101,8 @@ export default function Dashboard() {
       estado: "OFFLINE",
       motivo: "-",
       ts_ms: null,
+      lightOn: false,
+      fanOn: false,
     })
   );
 
@@ -90,62 +115,99 @@ export default function Dashboard() {
     luz: [],
   }));
 
-  const [net, setNet] = useState({ ok: true, lastErr: null, lastFetchMs: null });
+  const [net, setNet] = useState({ ok: true, lastErr: null, lastMs: null });
+
+  // CONTROL: lo que pide la web (desde /ctrl)
+  const [ctrl, setCtrl] = useState({ light: false, fan: false, ts_ms: null });
+  const [ctrlNet, setCtrlNet] = useState({ ok: true, lastErr: null });
 
   // Offline detector por “freeze de datos”
   const lastSeqRef = useRef(null);
   const lastChangeMsRef = useRef(Date.now());
-  const [offlineByStale, setOfflineByStale] = useState(false);
+  const offlineRef = useRef(false);
 
+  // Suscripción a /ctrl
   useEffect(() => {
-    if (!url) {
-      setNet({
-        ok: false,
-        lastErr: "URL Firebase no configurada",
-        lastFetchMs: null,
-      });
-      return;
-    }
-
     let alive = true;
 
-    async function tick() {
+    const unsubCtrl = onValue(
+      ctrlRef,
+      (snap) => {
+        if (!alive) return;
+        const v = snap.val() || {};
+        setCtrl({
+          light: Boolean(v.light ?? false),
+          fan: Boolean(v.fan ?? false),
+          ts_ms: Number.isFinite(+v.ts_ms) ? +v.ts_ms : null,
+        });
+        setCtrlNet({ ok: true, lastErr: null });
+      },
+      (err) => {
+        if (!alive) return;
+        setCtrlNet({ ok: false, lastErr: String(err?.message || err) });
+      }
+    );
+
+    return () => {
+      alive = false;
       try {
-        const res = await fetch(url, { cache: "no-store" });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
+        unsubCtrl();
+      } catch {}
+      try {
+        off(ctrlRef);
+      } catch {}
+    };
+  }, [ctrlRef]);
+
+  // Enviar comandos a /ctrl (la web manda; ESP32 ejecuta)
+  async function setLight(next) {
+    try {
+      await update(ctrlRef, { light: !!next, ts_ms: Date.now() });
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  async function setFan(next) {
+    try {
+      await update(ctrlRef, { fan: !!next, ts_ms: Date.now() });
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  // Suscripción a /live (telemetría)
+  useEffect(() => {
+    let alive = true;
+
+    const unsub = onValue(
+      liveRef,
+      (snap) => {
         if (!alive) return;
 
+        const data = snap.val();
         const norm = normalizeTelemetry(data);
         const now = Date.now();
 
-        // 1) Detecta si el payload “cambió” usando seq
         const seq = norm.seq;
         const seqChanged = seq != null && seq !== lastSeqRef.current;
 
         if (seqChanged) {
           lastSeqRef.current = seq;
           lastChangeMsRef.current = now;
-          if (offlineByStale) setOfflineByStale(false);
-        } else {
-          // Si seq no cambia, puede estar congelado
-          if (now - lastChangeMsRef.current > OFFLINE_TIMEOUT_MS) {
-            if (!offlineByStale) setOfflineByStale(true);
-          }
+          offlineRef.current = false;
         }
 
-        // 2) Aplica estado final (la consola manda)
         const finalTelemetry = {
           ...norm,
-          online: offlineByStale ? false : norm.online,
-          estado: offlineByStale ? "OFFLINE" : norm.estado,
-          motivo: offlineByStale ? "STALE DATA" : norm.motivo,
+          online: offlineRef.current ? false : norm.online,
+          estado: offlineRef.current ? "OFFLINE" : norm.estado,
+          motivo: offlineRef.current ? "STALE DATA" : norm.motivo,
         };
 
         setTelemetry(finalTelemetry);
-        setNet({ ok: true, lastErr: null, lastFetchMs: now });
+        setNet({ ok: true, lastErr: null, lastMs: now });
 
-        // 3) Historial: solo agrega punto cuando cambió seq
         if (seqChanged) {
           const ts = Number.isFinite(finalTelemetry.ts_ms)
             ? finalTelemetry.ts_ms
@@ -153,42 +215,53 @@ export default function Dashboard() {
 
           setHistory((h) => {
             const nh = { ...h };
-            if (finalTelemetry.T != null) nh.T = pushHistory(h, "T", { t: ts, v: finalTelemetry.T });
-            if (finalTelemetry.H != null) nh.H = pushHistory(h, "H", { t: ts, v: finalTelemetry.H });
-            if (finalTelemetry.HI != null) nh.HI = pushHistory(h, "HI", { t: ts, v: finalTelemetry.HI });
-            if (finalTelemetry.gas != null) nh.gas = pushHistory(h, "gas", { t: ts, v: finalTelemetry.gas });
-            if (finalTelemetry.base != null) nh.base = pushHistory(h, "base", { t: ts, v: finalTelemetry.base });
-            if (finalTelemetry.luz != null) nh.luz = pushHistory(h, "luz", { t: ts, v: finalTelemetry.luz });
+            if (finalTelemetry.T != null)
+              nh.T = pushHistory(h, "T", { t: ts, v: finalTelemetry.T });
+            if (finalTelemetry.H != null)
+              nh.H = pushHistory(h, "H", { t: ts, v: finalTelemetry.H });
+            if (finalTelemetry.HI != null)
+              nh.HI = pushHistory(h, "HI", { t: ts, v: finalTelemetry.HI });
+            if (finalTelemetry.gas != null)
+              nh.gas = pushHistory(h, "gas", { t: ts, v: finalTelemetry.gas });
+            if (finalTelemetry.base != null)
+              nh.base = pushHistory(h, "base", { t: ts, v: finalTelemetry.base });
+            if (finalTelemetry.luz != null)
+              nh.luz = pushHistory(h, "luz", { t: ts, v: finalTelemetry.luz });
             return nh;
           });
         }
-      } catch (e) {
+      },
+      (err) => {
         if (!alive) return;
-
         const now = Date.now();
-        setNet({ ok: false, lastErr: String(e?.message || e), lastFetchMs: now });
-
-        // Si no hay cambios por mucho tiempo, marca offline
-        if (now - lastChangeMsRef.current > OFFLINE_TIMEOUT_MS) {
-          setOfflineByStale(true);
-          setTelemetry((prev) => ({
-            ...prev,
-            online: false,
-            estado: "OFFLINE",
-            motivo: "LINK LOST",
-          }));
-        }
+        setNet({ ok: false, lastErr: String(err?.message || err), lastMs: now });
       }
-    }
+    );
 
-    tick();
-    const id = setInterval(tick, pollMs);
+    const staleId = setInterval(() => {
+      const now = Date.now();
+      if (now - lastChangeMsRef.current > OFFLINE_TIMEOUT_MS) {
+        offlineRef.current = true;
+        setTelemetry((prev) => ({
+          ...prev,
+          online: false,
+          estado: "OFFLINE",
+          motivo: "STALE DATA",
+        }));
+      }
+    }, STALE_CHECK_MS);
 
     return () => {
       alive = false;
-      clearInterval(id);
+      clearInterval(staleId);
+      try {
+        unsub();
+      } catch {}
+      try {
+        off(liveRef);
+      } catch {}
     };
-  }, [url, pollMs, offlineByStale]);
+  }, [liveRef]);
 
   return (
     <div className="dash">
@@ -240,31 +313,104 @@ export default function Dashboard() {
           <div className="flags">
             <div className={"flag " + (telemetry.rain ? "on" : "")}>RAIN</div>
             <div className={"flag " + (telemetry.flame ? "on" : "")}>FLAME</div>
-            <div className={"flag " + (telemetry.soloPeligro ? "on" : "")}>SOLO-PELIGRO</div>
-            <div className={"flag " + (telemetry.online ? "on" : "")}>ONLINE</div>
+            <div className={"flag " + (telemetry.soloPeligro ? "on" : "")}>
+              SOLO-PELIGRO
+            </div>
+            <div className={"flag " + (telemetry.online ? "on" : "")}>
+              ONLINE
+            </div>
           </div>
+
+         
         </div>
 
         <div className="noteBlock">
           <div className="noteTitle">CANAL</div>
           <div className="noteText">
-            Arduino UNO (sensores) → ESP32 (gateway UART con ACK/CRC/SEQ) → Firebase RTDB → Consola Web.
-          </div>
-
-          <div className="noteTitle" style={{ marginTop: 14 }}>
-            REGLAS VISUALES
-          </div>
-          <div className="noteText">
-            NORMAL / ALERTA / PELIGRO se renderiza como señal de misión: glow, bordes, ruido ligero y rejilla.
+            Arduino UNO (sensores) → ESP32 (gateway UART con ACK/CRC/SEQ) → Firebase
+            RTDB → Consola Web.
           </div>
 
           <div className="noteTitle" style={{ marginTop: 14 }}>
             OFFLINE RULE
           </div>
           <div className="noteText">
-            Si el <span className="mono">seq</span> no cambia por {OFFLINE_TIMEOUT_MS}ms → OFFLINE.
+            Si el <span className="mono">seq</span> no cambia por{" "}
+            {OFFLINE_TIMEOUT_MS}ms → OFFLINE.
           </div>
         </div>
+         {/* ===== CONTROL ===== */}
+          <div className="controlBlock">
+            <div className="controlTitle">CONTROL</div>
+
+            <div className="controlRow">
+              <div className="controlLeft">
+                <div className="controlLabel">LUCES</div>
+                <div className="controlState mono">
+                  CMD: {ctrl.light ? "ON" : "OFF"} · ESP32:{" "}
+                  <span className={telemetry.lightOn ? "ok" : "muted"}>
+                    {telemetry.lightOn ? "ON" : "OFF"}
+                  </span>
+                </div>
+              </div>
+
+              <div className="controlBtns">
+                <button
+                  className={"btnCtl " + (ctrl.light ? "on" : "")}
+                  onClick={() => setLight(true)}
+                  disabled={!mounted}
+                >
+                  PRENDER
+                </button>
+                <button
+                  className={"btnCtl " + (!ctrl.light ? "on" : "")}
+                  onClick={() => setLight(false)}
+                  disabled={!mounted}
+                >
+                  APAGAR
+                </button>
+              </div>
+            </div>
+
+            <div className="controlRow">
+              <div className="controlLeft">
+                <div className="controlLabel">VENTILADOR</div>
+                <div className="controlState mono">
+                  CMD: {ctrl.fan ? "ON" : "OFF"} · ESP32:{" "}
+                  <span className={telemetry.fanOn ? "ok" : "muted"}>
+                    {telemetry.fanOn ? "ON" : "OFF"}
+                  </span>
+                </div>
+              </div>
+
+              <div className="controlBtns">
+                <button
+                  className={"btnCtl " + (ctrl.fan ? "on" : "")}
+                  onClick={() => setFan(true)}
+                  disabled={!mounted}
+                >
+                  PRENDER
+                </button>
+                <button
+                  className={"btnCtl " + (!ctrl.fan ? "on" : "")}
+                  onClick={() => setFan(false)}
+                  disabled={!mounted}
+                >
+                  APAGAR
+                </button>
+              </div>
+            </div>
+
+            <div className={"controlNet mono " + (ctrlNet.ok ? "ok" : "bad")}>
+              CTRL {ctrlNet.ok ? "SYNC OK" : "SYNC ERROR"}
+              {ctrlNet.lastErr ? (
+                <span className="muted"> · {ctrlNet.lastErr}</span>
+              ) : null}
+              {telemetry.lastCtrlErr ? (
+                <span className="muted"> · ESP32: {telemetry.lastCtrlErr}</span>
+              ) : null}
+            </div>
+          </div>
       </div>
 
       <div className="grid">
@@ -319,9 +465,9 @@ export default function Dashboard() {
       </div>
 
       <div className="hintRow">
-        <div className="hintPill mono">POLL {pollMs}ms</div>
-        <div className="hintPill mono">URL {url ? "OK" : "MISSING"}</div>
+        <div className="hintPill mono">MODE REALTIME</div>
         <div className="hintPill mono">HIST {HISTORY_LEN} pts</div>
+        <div className="hintPill mono">STALE {OFFLINE_TIMEOUT_MS}ms</div>
       </div>
     </div>
   );

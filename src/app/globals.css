@@ -478,3 +478,44 @@ body{
   .grid{ grid-template-columns: 1fr; }
   .tagline{ white-space: normal; }
 }
+
+.controlBlock{
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255,255,255,.06);
+}
+.controlTitle{
+  font-size: 12px;
+  letter-spacing: .12em;
+  opacity: .8;
+  margin-bottom: 10px;
+}
+.controlRow{
+  display:flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px dashed rgba(255,255,255,.06);
+}
+.controlLeft{ min-width: 220px; }
+.controlLabel{ font-weight: 700; }
+.controlState{ font-size: 12px; margin-top: 4px; opacity: .9; }
+
+.controlBtns{ display:flex; gap: 8px; align-items:center; }
+.btnCtl{
+  color: rgba(215,230,255,.92);
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(255,255,255,.12);
+  background: rgba(0,0,0,.25);
+  cursor: pointer;
+  font-family: inherit;
+}
+.btnCtl.on{
+  color: rgba(215,230,255,.92);
+  border-color: rgba(0,255,180,.35);
+  background: rgba(0,255,180,.08);
+}
+.btnCtl:disabled{ opacity:.5; cursor:not-allowed; }
+
+.controlNet{ margin-top: 10px; font-size: 12px; }
